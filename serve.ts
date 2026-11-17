@@ -19,7 +19,7 @@ const types = {
 
 const server = createServer((req, res) => {
   const path = normalize(join(root, decodeURIComponent(req.url.split('?')[0])));
-  const file = path === root ? join(root, 'index.html') : path;
+  const file = (path === root || path === root + '/') ? join(root, 'index.html') : path;
   if (!file.startsWith(root) || !existsSync(file) || !statSync(file).isFile()) {
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('not found');
