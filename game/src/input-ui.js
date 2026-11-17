@@ -101,7 +101,7 @@ export function drawHUD(ctx, w, h, view) {
   ctx.fillStyle = '#fff';
   ctx.font = 'bold 13px sans-serif';
   if (wanted.level > 0) {
-    ctx.fillText(wanted.level >= 3 ? 'POLISI MENGEJAR!' : 'WANTED', w - 24, 66);
+    ctx.fillText(wanted.level >= 3 ? 'POLISI MENGEJAR' : 'WANTED', w - 24, 66);
   }
 
   // Misi: banner atas-tengah.

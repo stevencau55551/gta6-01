@@ -467,20 +467,20 @@ function stageShot(name) {
   state.traffic = spawnTraffic(random, 14, { x: 1500, y: 900 });
   state.peds = spawnPedestrians(random, 20, { x: 1500, y: 900 });
   if (name === 'overview') {
-    state.player = createPlayer(1520, 900);
+    state.player = createPlayer(1360, 820);
     state.player.cash = 650;
     state.mission.index = 0; state.mission.step = 1;
-    state.camera.x = 1520 - canvas.width / 2;
-    state.camera.y = 900 - canvas.height / 2;
+    state.camera.x = 1360 - canvas.width / 2;
+    state.camera.y = 820 - canvas.height / 2;
     announce('Misi 1: antar paket ke warung Bu Sari.');
   } else if (name === 'drive') {
-    const car = createCar(1500, 980, 0, { color: '#0984e3', type: 'sedan' });
+    const car = createCar(1120, 980, 0, { color: '#0984e3', type: 'sedan' });
     car.speed = 240;
-    state.player = createPlayer(1500, 980);
+    state.player = createPlayer(1120, 980);
     state.player.inCar = car;
     car.isPlayerCar = true;
     state.mission.index = 0; state.mission.step = 1;
-    state.camera.x = 1500 - canvas.width / 2;
+    state.camera.x = 1120 - canvas.width / 2;
     state.camera.y = 980 - canvas.height / 2;
     announce('Mengemudi ke warung Bu Sari — ikuti marker kuning!');
   } else if (name === 'chase') {
@@ -526,7 +526,10 @@ const STEP = 1 / 60;
 function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
-  if (state.screen === 'play') {
+  // Jeda bisa dibuka dari layar pause (update() tidak berjalan saat jeda).
+  if (state.screen === 'paused' && input.consumePause()) setScreen('play');
+  // Mode screenshot: adegan dibekukan persis seperti ditata (tanpa update).
+  if (state.screen === 'play' && !shot) {
     accumulator += dt;
     while (accumulator >= STEP) { update(STEP); accumulator -= STEP; }
   }
