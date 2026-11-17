@@ -1,30 +1,34 @@
-// main.js — init, game loop, dan koordinasi state Teluk Arun.
+// main.js — init, game loop, dan koordinasi state Teluk Arun v2.
 // Layar: title | play | paused | over | victory. Mode ?shot=... menata adegan
 // untuk screenshot (overview | drive | chase | action) lalu set window.__shotReady.
-import { WORLD_W, WORLD_H, generateCity, mulberry32, drawWorld, isOnRoad, roadSpawn } from './world.js';
+// Sistem baru v2: bensin + SPBU, 10 koin Arun, kerja taksi, jam + distrik,
+// jejak ban, ledakan, musik latar, musuh yang strafe.
+import { WORLD_W, WORLD_H, generateCity, mulberry32, drawWorld, districtAt, GAS_STATION } from './world.js';
 import {
   createPlayer, createCar, createPedestrian, updatePlayerCar, updateTrafficCar,
   updatePoliceCar, updatePedestrian, updatePlayerOnFoot, drawCar, drawPlayer,
   drawPedestrian, spawnTraffic, spawnPedestrians, angleDiff,
 } from './entities.js';
 import {
-  MISSIONS, createMissionState, currentMission, currentStep, missionObjective,
+  MISSIONS, createMissionState, currentMission, missionObjective, missionProgress,
   createWanted, addWanted, updateWanted, wantedPoliceCount, createBullet,
   updateBullets, createEnemy, updateEnemy, drawEnemy, updateMission,
-  spawnMissionEnemies, spawnBoss, spawnSportCar,
+  spawnMissionEnemies, spawnBoss, spawnSportCar, createCoins, updateCoins, drawCoin,
+  COIN_VALUE, createTaxiJob, startTaxiJob, updateTaxiJob,
 } from './systems.js';
 import {
-  createParticles, spawnParticles, updateParticles, drawParticles,
+  createParticles, spawnParticles, spawnExplosion, spawnMuzzle, updateParticles, drawParticles,
+  createSkids, addSkid, updateSkids, drawSkids,
   createShake, addShake, shakeOffset, drawLighting,
-  createAudio, ensureAudio, playShot, playPunch, playPickup, playMission,
-  playHorn, playCrash, playSiren, updateEngineSound,
+  createAudio, ensureAudio, playShot, playPunch, playPickup, playCoin, playMission,
+  playHorn, playCrash, playSiren, updateEngineSound, updateMusic,
 } from './effects.js';
 import {
   createInput, drawHUD, drawMinimap, showMenu, hideMenu,
   startMenuHTML, pauseMenuHTML, gameOverHTML, victoryHTML,
 } from './input-ui.js';
 
-const SAVE_KEY = 'teluk-arun-save-v1';
+const SAVE_KEY = 'teluk-arun-save-v2';
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
@@ -47,6 +51,7 @@ const city = generateCity(seed);
 const input = createInput(canvas);
 const audio = createAudio();
 const particles = createParticles();
+const skids = createSkids();
 const shake = createShake();
 
 // ---- State permainan ----
@@ -58,12 +63,16 @@ const state = {
   police: [],
   enemies: [],
   bullets: [],
+  coins: createCoins(seed),
+  taxi: createTaxiJob(),
+  taxiPed: null,
   mission: createMissionState(),
   wanted: createWanted(),
   camera: { x: 0, y: 0, w: canvas.width, h: canvas.height },
   message: '', messageTimer: 0,
   time: 0, elapsed: 0,
   enemiesSpawned: false, bossSpawned: false, sportSpawned: false,
+  refuelTimer: 0,
   events: [],
 };
 
@@ -72,6 +81,8 @@ function saveGame() {
     window.localStorage.setItem(SAVE_KEY, JSON.stringify({
       missionIndex: state.mission.index, cash: state.player.cash,
       hp: state.player.hp, ammo: state.player.ammo,
+      coins: state.coins.filter((c) => c.taken).map((c) => c.id),
+      fares: state.player.faresDone,
     }));
   } catch { /* penyimpanan boleh mati */ }
 }
@@ -94,7 +105,7 @@ function setScreen(name) {
   if (name === 'title') showMenu(menuEl, startMenuHTML(!!loadSave()));
   else if (name === 'paused') showMenu(menuEl, pauseMenuHTML());
   else if (name === 'over') showMenu(menuEl, gameOverHTML('Polisi menangkap Raka di tengah jalan.', state.player.cash));
-  else if (name === 'victory') showMenu(menuEl, victoryHTML(state.player.cash));
+  else if (name === 'victory') showMenu(menuEl, victoryHTML(state.player.cash, state.player.coins, state.player.faresDone));
   else hideMenu(menuEl);
   wireMenuButtons();
 }
@@ -114,24 +125,36 @@ function wireMenuButtons() {
   if (again) again.onclick = () => startGame(true);
 }
 
-function startGame(fresh) {
-  const save = fresh ? null : loadSave();
+function resetWorld() {
   state.player = createPlayer(720, 620);
   state.mission = createMissionState();
   state.wanted = createWanted();
   state.police = [];
   state.enemies = [];
   state.bullets = [];
+  state.coins = createCoins(seed);
+  state.taxi = createTaxiJob();
+  state.taxiPed = null;
   state.enemiesSpawned = false;
   state.bossSpawned = false;
   state.sportSpawned = false;
   state.traffic = spawnTraffic(random, 14, state.player);
   state.peds = spawnPedestrians(random, 22, state.player);
+}
+
+function startGame(fresh) {
+  const save = fresh ? null : loadSave();
+  resetWorld();
   if (save) {
     state.mission.index = Math.min(save.missionIndex || 0, MISSIONS.length - 1);
     state.player.cash = save.cash || 250;
     state.player.hp = save.hp || 100;
     state.player.ammo = save.ammo ?? 24;
+    state.player.faresDone = save.fares || 0;
+    for (const id of save.coins || []) {
+      const c = state.coins[id];
+      if (c) { c.taken = true; state.player.coins += 1; }
+    }
     announce(`Selamat datang kembali, Raka. Misi ${state.mission.index + 1} menanti.`);
   } else {
     announce('Misi 1: ambil paket di gudang pelabuhan.');
@@ -159,6 +182,15 @@ function enterCar(car) {
     car.isPolice = false;
   }
   playHorn(audio);
+  // Naik taksi = mulai kerja taksi (penumpang muncul di trotoar).
+  if (car.type === 'taxi' && !state.taxi.active) {
+    startTaxiJob(state.taxi, state.player, random);
+    state.taxiPed = createPedestrian(state.taxi.passenger.x, state.taxi.passenger.y, random);
+    state.taxiPed.x = state.taxi.passenger.x;
+    state.taxiPed.y = state.taxi.passenger.y;
+    state.taxiPed.waitingTaxi = true;
+    announce(`Taksi aktif! Jemput penumpang di dekatmu — tarif $${state.taxi.fare}.`);
+  }
 }
 
 function exitCar() {
@@ -170,6 +202,7 @@ function exitCar() {
   state.player.y = car.y + Math.sin(car.angle + Math.PI / 2) * 34;
   state.player.inCar = null;
   state.traffic.push(car);
+  // Keluar taksi di tengah order: penumpang menunggu 30 detik lalu pergi.
 }
 
 function stealCar() {
@@ -197,7 +230,7 @@ function playerShoot() {
   state.bullets.push(createBullet(p.x + Math.cos(angle) * 18, p.y + Math.sin(angle) * 18, angle, true));
   playShot(audio);
   addShake(shake, 0.12);
-  spawnParticles(particles, p.x + Math.cos(angle) * 22, p.y + Math.sin(angle) * 22, { count: 5, color: '#fdcb6e', speed: 160 });
+  spawnMuzzle(particles, p.x, p.y, angle);
 }
 
 function playerPunch() {
@@ -218,7 +251,7 @@ function playerPunch() {
 function onEnemyDown(e) {
   state.mission.kills += 1;
   state.player.cash += 50;
-  spawnParticles(particles, e.x, e.y, { count: 18, color: '#e17055' });
+  spawnExplosion(particles, e.x, e.y);
   announce(e.isBoss ? 'Darma tumbang! Utang lunas.' : 'Anak buah tumbang. +$50');
   if (e.isBoss) addWanted(state.wanted, 1, 'kalahkan bos');
 }
@@ -237,6 +270,23 @@ function syncPolice(dt) {
     state.police.push(car);
   }
   while (state.police.length > want) state.police.pop();
+}
+
+// ---- Isi bensin di SPBU Arun: berhenti dekat pompa, $10 per 20 unit ----
+function updateRefuel(dt) {
+  const car = state.player.inCar;
+  if (!car) { state.refuelTimer = 0; return; }
+  const nearPump = Math.hypot(car.x - GAS_STATION.x, car.y - GAS_STATION.y) < GAS_STATION.radius;
+  if (!nearPump || Math.abs(car.speed) > 10 || car.fuel >= 100) { state.refuelTimer = 0; return; }
+  if (state.player.cash < 10) return;
+  state.refuelTimer += dt;
+  if (state.refuelTimer >= 1) {
+    state.refuelTimer = 0;
+    car.fuel = Math.min(100, car.fuel + 20);
+    state.player.cash -= 10;
+    playPickup(audio);
+    if (car.fuel >= 100) announce('Tangki penuh. Selamat jalan!');
+  }
 }
 
 // ---- Update per frame ----
@@ -284,8 +334,17 @@ function update(dt) {
   // Gerakan pemain / mobil.
   if (p.inCar) {
     const prevSpeed = p.inCar.speed;
+    const prevAngle = p.inCar.angle;
     updatePlayerCar(p.inCar, input, dt, city.buildings);
+    // Jejak ban saat menikung kencang.
+    if (Math.abs(p.inCar.speed) > 200 && Math.abs(angleDiff(p.inCar.angle, prevAngle)) > 0.02) {
+      addSkid(skids, p.inCar.x - Math.cos(p.inCar.angle) * 18, p.inCar.y - Math.sin(p.inCar.angle) * 18, p.inCar.angle);
+    }
     if (Math.abs(prevSpeed - p.inCar.speed) > 180) { playCrash(audio); addShake(shake, 0.3); }
+    if (p.inCar.fuel <= 0 && Math.abs(p.inCar.speed) < 5 && state.messageTimer <= 0) {
+      announce('Bensin habis! Dorong ke SPBU Arun (tanda oranye di minimap).');
+      state.messageTimer = 4;
+    }
     // Tabrak pejalan kaki = kejahatan.
     for (const ped of state.peds) {
       if (Math.hypot(ped.x - p.inCar.x, ped.y - p.inCar.y) < 26 && Math.abs(p.inCar.speed) > 80) {
@@ -302,6 +361,23 @@ function update(dt) {
       p.angle = Math.atan2(wy - p.y, wx - p.x);
     }
   }
+
+  updateRefuel(dt);
+
+  // Koin Arun.
+  updateCoins(state.coins, p, (c) => {
+    p.coins += 1;
+    p.cash += COIN_VALUE;
+    playCoin(audio);
+    spawnParticles(particles, c.x, c.y, { count: 10, color: '#f1c40f' });
+    announce(`Koin Arun ${p.coins}/10! +$${COIN_VALUE}`);
+    saveGame();
+  });
+
+  // Kerja taksi.
+  updateTaxiJob(state.taxi, p, dt, state.events);
+  if (state.taxi.phase === 'drive' && state.taxiPed) state.taxiPed = null;
+  if (!state.taxi.active && state.taxi.phase !== 'pickup') state.taxiPed = null;
 
   // Lalu lintas & pejalan kaki.
   const danger = { x: p.inCar ? p.inCar.x : p.x, y: p.inCar ? p.inCar.y : p.y };
@@ -341,11 +417,11 @@ function update(dt) {
   }
   state.enemies = state.enemies.filter((e) => e.hp > 0);
 
-  // Peluru.
-  const targets = [...state.enemies, playerTarget];
-  state.bullets = updateBullets(state.bullets, dt, city.buildings, targets, (t, b) => {
+  // Peluru. Perbaikan v1: hp target pemain disinkronkan tiap frame supaya
+  // peluru musuh berhenti mengenai pemain yang sudah tumbang.
+  playerTarget.hp = p.hp;
+  state.bullets = updateBullets(state.bullets, dt, city.buildings, [...state.enemies, playerTarget], (t, b) => {
     if (t === playerTarget) {
-      // playerTarget hanya membawa posisi; damage sungguhan masuk ke p.hp.
       p.hp -= b.damage;
       p.hurtFlash = 0.3;
       addShake(shake, 0.15);
@@ -358,20 +434,20 @@ function update(dt) {
   // Ammo pickup pasif: peluru bertambah pelan saat tenang.
   if (state.wanted.level === 0 && p.ammo < 24 && Math.random() < dt * 0.2) p.ammo += 1;
 
-  // Misi.
+  // Misi (perbaikan v1: wanted level kini diteruskan sebagai parameter,
+  // jadi langkah "kabur sampai wanted 0" benar-benar bisa selesai).
   const before = state.mission.index;
   const beforeStep = state.mission.step;
-  updateMission(state.mission, p, state.enemies, state.events);
+  updateMission(state.mission, p, state.enemies, state.events, state.wanted.level);
   if (state.mission.index !== before || state.mission.step !== beforeStep) {
     const m = currentMission(state.mission);
     if (m) {
-      p.cash += 0; // reward diberikan di akhir misi
       playMission(audio);
       announce(m.steps[state.mission.step].text);
       saveGame();
     }
   }
-  // Reward misi selesai (terdeteksi dari event).
+  // Event antrean: reward misi, tarif taksi, tamat.
   for (const ev of state.events) {
     if (ev.type === 'mission') {
       const idx = state.mission.index - 1;
@@ -379,6 +455,14 @@ function update(dt) {
       playMission(audio);
       announce(ev.text);
       saveGame();
+    } else if (ev.type === 'taxi-paid') {
+      p.cash += ev.fare;
+      p.faresDone += 1;
+      playMission(audio);
+      announce(ev.text);
+      saveGame();
+    } else if (ev.type === 'taxi') {
+      announce(ev.text);
     } else if (ev.type === 'step') {
       playPickup(audio);
     } else if (ev.type === 'story') {
@@ -393,7 +477,9 @@ function update(dt) {
   if (state.wanted.level === 0 && p.hp < p.maxHp) p.hp = Math.min(p.maxHp, p.hp + 2 * dt);
 
   updateParticles(particles, dt);
+  updateSkids(skids, dt);
   updateEngineSound(audio, p.inCar ? p.inCar.speed : 0, !!p.inCar);
+  updateMusic(audio, dt);
 
   // Kamera mengikuti pemain dengan mulus.
   const focus = p.inCar ? p.inCar : p;
@@ -413,6 +499,7 @@ function render() {
   ctx.save();
   ctx.translate(-cam.x + so.x, -cam.y + so.y);
   drawWorld(ctx, city, { x: cam.x, y: cam.y, w: canvas.width, h: canvas.height }, state.time * 1000);
+  drawSkids(ctx, skids);
   // Penanda objektif misi di dunia.
   const obj = missionObjective(state.mission);
   if (obj && state.screen === 'play') {
@@ -429,10 +516,23 @@ function render() {
     ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(obj.x, obj.y); ctx.stroke();
     ctx.setLineDash([]);
   }
+  // Tujuan taksi: penanda hijau.
+  if (state.taxi.active && state.taxi.phase === 'drive') {
+    const d = state.taxi.dest;
+    ctx.strokeStyle = '#2ecc71';
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(d.x, d.y, 24 + Math.sin(state.time * 4) * 5, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = '#2ecc71';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('$', d.x, d.y + 6);
+  }
+  for (const c of state.coins) drawCoin(ctx, c, state.time * 1000);
   for (const c of state.traffic) drawCar(ctx, c, state.time);
   for (const pc of state.police) drawCar(ctx, pc, state.time);
   if (state.player.inCar) drawCar(ctx, state.player.inCar, state.time);
-  for (const ped of state.peds) drawPedestrian(ctx, ped);
+  for (const ped of state.peds) drawPedestrian(ctx, ped, state.time * 1000);
+  if (state.taxiPed) drawPedestrian(ctx, state.taxiPed, state.time * 1000);
   for (const e of state.enemies) drawEnemy(ctx, e);
   if (!state.player.inCar) drawPlayer(ctx, state.player, state.time * 1000);
   drawParticles(ctx, particles);
@@ -443,21 +543,28 @@ function render() {
   }
   ctx.restore();
 
-  drawLighting(ctx, canvas.width, canvas.height);
+  // Cahaya sore: makin jingga seiring jam dalam game.
+  const sunPhase = ((state.elapsed % 600) / 600);
+  drawLighting(ctx, canvas.width, canvas.height, sunPhase);
 
   if (state.screen === 'play' || state.screen === 'paused') {
     const p = state.player;
+    const focus = p.inCar ? p.inCar : p;
     drawHUD(ctx, canvas.width, canvas.height, {
       player: p, wanted: state.wanted,
       mission: obj ? { title: currentMission(state.mission)?.title || '', text: obj.text } : null,
+      progress: missionProgress(state.mission),
       cash: p.cash, time: state.time,
       speedKmh: p.inCar ? Math.abs(p.inCar.speed) * 0.36 : 0,
       inCar: !!p.inCar, ammo: p.ammo,
       message: state.message, messageTimer: state.messageTimer,
+      district: districtAt(focus.x, focus.y),
+      coins: p.coins, coinsTotal: state.coins.length,
+      taxi: state.taxi,
     });
     drawMinimap(ctx, canvas.width, canvas.height, {
       player: p, police: state.police, traffic: state.traffic,
-      mission: obj, enemies: state.enemies,
+      mission: obj, enemies: state.enemies, coins: state.coins, taxi: state.taxi,
     });
   }
 }
@@ -467,22 +574,32 @@ function stageShot(name) {
   state.traffic = spawnTraffic(random, 14, { x: 1500, y: 900 });
   state.peds = spawnPedestrians(random, 20, { x: 1500, y: 900 });
   if (name === 'overview') {
-    state.player = createPlayer(1360, 820);
+    // Raka jalan kaki di Pasar Senja — koin Arun + lalu lintas + marker misi.
+    state.player = createPlayer(2100, 800);
     state.player.cash = 650;
+    state.player.coins = 2;
+    state.coins[3].taken = true;
+    state.coins[4].taken = true;
     state.mission.index = 0; state.mission.step = 1;
-    state.camera.x = 1360 - canvas.width / 2;
-    state.camera.y = 820 - canvas.height / 2;
-    announce('Misi 1: antar paket ke warung Bu Sari.');
+    state.camera.x = 2100 - canvas.width / 2;
+    state.camera.y = 800 - canvas.height / 2;
+    announce('Misi 1: antar paket ke warung Bu Sari — koin Arun 2/10.');
   } else if (name === 'drive') {
-    const car = createCar(1120, 980, 0, { color: '#0984e3', type: 'sedan' });
+    // Raka menyetir taksi dengan penumpang — bensin + tarif terlihat di HUD.
+    const car = createCar(1120, 980, 0, { color: '#f1c40f', type: 'taxi' });
     car.speed = 240;
+    car.fuel = 78;
     state.player = createPlayer(1120, 980);
     state.player.inCar = car;
     car.isPlayerCar = true;
+    state.taxi.active = true;
+    state.taxi.phase = 'drive';
+    state.taxi.dest = { x: 3080, y: 1700, label: 'Jl. Ombak' };
+    state.taxi.fare = 120;
     state.mission.index = 0; state.mission.step = 1;
     state.camera.x = 1120 - canvas.width / 2;
     state.camera.y = 980 - canvas.height / 2;
-    announce('Mengemudi ke warung Bu Sari — ikuti marker kuning!');
+    announce('Taksi: antar penumpang ke Jl. Ombak — tarif $120.');
   } else if (name === 'chase') {
     const car = createCar(1920, 1340, 0, { color: '#f1c40f', type: 'sport' });
     car.speed = 300;
@@ -490,23 +607,34 @@ function stageShot(name) {
     state.player.inCar = car;
     car.isPlayerCar = true;
     state.wanted.level = 3;
+    state.wanted.lastReason = 'curi mobil';
     state.mission.index = 1; state.mission.step = 1;
     for (let i = 0; i < 3; i++) {
       state.police.push(createCar(1920 - 160 - i * 90, 1340 + (i - 1) * 60, 0, { color: '#0a3d91', type: 'sedan', isPolice: true }));
     }
+    // Jejak ban di belakang mobil pemain (adegan kejar-kejaran).
+    for (let i = 0; i < 12; i++) addSkid(skids, 1920 - 60 - i * 22, 1340 + (i % 2 ? 10 : -10), 0);
     state.camera.x = 1920 - canvas.width / 2;
     state.camera.y = 1340 - canvas.height / 2;
-    announce('KABUR! Polisi mengejar — wanted ★★★');
+    announce('KABUR! Polisi mengejar — wanted ★★★ (curi mobil)');
   } else if (name === 'action') {
-    state.player = createPlayer(260, 2060);
+    // Pertarungan digeser +160px ke timur supaya Raka + Darma tidak menempel
+    // tepi kiri frame (revisi setelah tinjau screenshot v2); marker misi
+    // tetap di (200,2060) dan masih terlihat di frame.
+    state.player = createPlayer(420, 2060);
     state.player.hp = 68;
     state.player.ammo = 18;
     state.wanted.level = 4;
+    state.wanted.lastReason = 'kalahkan bos';
     state.mission.index = 2; state.mission.step = 0;
     state.enemies = spawnMissionEnemies(random);
-    state.enemies.push(spawnBoss());
-    spawnParticles(particles, 260, 2060, { count: 12, color: '#fdcb6e' });
-    state.camera.x = 260 - canvas.width / 2;
+    for (const e of state.enemies) e.x += 160;
+    const boss = spawnBoss();
+    boss.x += 160;
+    state.enemies.push(boss);
+    spawnExplosion(particles, 360, 2060);
+    spawnParticles(particles, 420, 2060, { count: 12, color: '#fdcb6e' });
+    state.camera.x = 420 - canvas.width / 2;
     state.camera.y = 2060 - canvas.height / 2;
     announce('Pelabuhan malam: kalahkan anak buah Darma!');
   }

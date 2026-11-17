@@ -1,5 +1,6 @@
-// effects.js — partikel, guncangan kamera, cahaya matahari, dan suara WebAudio
-// (osilator murni, tanpa file eksternal; semua suara dibuat di kode).
+// effects.js — partikel, jejak ban, ledakan, guncangan kamera, cahaya
+// matahari sore, dan suara WebAudio (osilator murni, tanpa file eksternal;
+// semua suara dan musik dibuat di kode).
 export function createParticles() {
   return [];
 }
@@ -18,6 +19,18 @@ export function spawnParticles(particles, x, y, opts = {}) {
   }
 }
 
+// Ledakan: campuran api oranye + asap abu-abu, untuk bos tumbang.
+export function spawnExplosion(particles, x, y) {
+  spawnParticles(particles, x, y, { count: 26, color: '#ff9f43', speed: 320 });
+  spawnParticles(particles, x, y, { count: 14, color: '#636e72', speed: 120 });
+  spawnParticles(particles, x, y, { count: 10, color: '#fdcb6e', speed: 420 });
+}
+
+// Kilat moncong pistol: partikel kuning pendek di ujung laras.
+export function spawnMuzzle(particles, x, y, angle) {
+  spawnParticles(particles, x + Math.cos(angle) * 14, y + Math.sin(angle) * 14, { count: 4, color: '#ffeaa7', speed: 260 });
+}
+
 export function updateParticles(particles, dt) {
   for (const p of particles) {
     p.x += p.vx * dt; p.y += p.vy * dt;
@@ -32,6 +45,35 @@ export function drawParticles(ctx, particles) {
     ctx.globalAlpha = Math.max(0, p.life / p.maxLife);
     ctx.fillStyle = p.color;
     ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---- Jejak ban: garis gelap pendek saat mobil menikung kencang ----
+export function createSkids() {
+  return [];
+}
+
+export function addSkid(skids, x, y, angle) {
+  skids.push({ x, y, angle, life: 2.2 });
+  if (skids.length > 220) skids.splice(0, skids.length - 220);
+}
+
+export function updateSkids(skids, dt) {
+  for (const s of skids) s.life -= dt;
+  return skids.filter((s) => s.life > 0);
+}
+
+export function drawSkids(ctx, skids) {
+  for (const s of skids) {
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(s.angle);
+    ctx.globalAlpha = Math.min(0.5, s.life * 0.25);
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(-7, -11, 14, 3);
+    ctx.fillRect(-7, 8, 14, 3);
+    ctx.restore();
   }
   ctx.globalAlpha = 1;
 }
@@ -55,9 +97,11 @@ export function shakeOffset(shake, dt, time) {
 }
 
 // Cahaya: gradien hangat matahari sore + vignette halus.
-export function drawLighting(ctx, w, h) {
+// sunPhase 0..1: sore makin jingga saat mendekati 1 (jam dalam game).
+export function drawLighting(ctx, w, h, sunPhase = 0.3) {
+  const warm = 0.05 + sunPhase * 0.07;
   const g = ctx.createLinearGradient(0, 0, w, h);
-  g.addColorStop(0, 'rgba(255, 214, 130, 0.06)');
+  g.addColorStop(0, `rgba(255, 190, 110, ${warm})`);
   g.addColorStop(0.6, 'rgba(255, 214, 130, 0.0)');
   g.addColorStop(1, 'rgba(20, 20, 60, 0.10)');
   ctx.fillStyle = g;
@@ -71,7 +115,7 @@ export function drawLighting(ctx, w, h) {
 
 // ---- Audio: WebAudio murni, aman bila AudioContext belum diizinkan ----
 export function createAudio() {
-  return { ctx: null, muted: false, engineOsc: null, engineGain: null, sirenTimer: 0 };
+  return { ctx: null, muted: false, engineOsc: null, engineGain: null, sirenTimer: 0, musicTimer: 0, musicStep: 0 };
 }
 
 export function ensureAudio(audio) {
@@ -110,6 +154,7 @@ export function playShot(audio) {
 
 export function playPunch(audio) { tone(audio, 140, 0.08, 'square', 0.12, 70); }
 export function playPickup(audio) { tone(audio, 660, 0.12, 'sine', 0.12); setTimeout(() => tone(audio, 990, 0.16, 'sine', 0.12), 90); }
+export function playCoin(audio) { tone(audio, 1320, 0.1, 'sine', 0.1); setTimeout(() => tone(audio, 1760, 0.14, 'sine', 0.1), 80); }
 export function playMission(audio) {
   tone(audio, 523, 0.14, 'triangle', 0.14);
   setTimeout(() => tone(audio, 659, 0.14, 'triangle', 0.14), 130);
@@ -124,6 +169,23 @@ export function playSiren(audio, dt, wanted) {
     audio.sirenTimer = 0.45;
     audio.sirenHigh = !audio.sirenHigh;
     tone(audio, audio.sirenHigh ? 880 : 660, 0.4, 'sine', 0.045);
+  }
+}
+
+// Musik latar: loop pentatonik pelan (nada A minor pentatonik), satu nada
+// tiap 0.42 detik, volume sangat kecil — orisinal, tanpa file eksternal.
+const MUSIC_NOTES = [220, 261.63, 293.66, 329.63, 392, 440, 392, 329.63, 293.66, 261.63, 220, 196];
+export function updateMusic(audio, dt) {
+  const ctx = ensureAudio(audio);
+  if (!ctx || audio.muted) return;
+  audio.musicTimer -= dt;
+  if (audio.musicTimer <= 0) {
+    audio.musicTimer = 0.42;
+    const n = MUSIC_NOTES[audio.musicStep % MUSIC_NOTES.length];
+    audio.musicStep += 1;
+    // Nada utama + oktaf bawah samar (bass).
+    tone(audio, n, 0.38, 'triangle', 0.035);
+    if (audio.musicStep % 4 === 1) tone(audio, n / 2, 0.5, 'sine', 0.03);
   }
 }
 

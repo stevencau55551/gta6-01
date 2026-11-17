@@ -1,6 +1,6 @@
-// entities.js — pemain, kendaraan (lalu lintas, polisi), pejalan kaki.
-// Semua entitas bergerak di koordinat dunia; render digambar top-down.
-import { V_ROADS, H_ROADS, ROAD_W, WORLD_W, WORLD_H, isOnRoad, nearestRoadPoint, roadSpawn, resolveBuildingCollision, clampWorld, mulberry32 } from './world.js';
+// entities.js — pemain, kendaraan (lalu lintas, taksi, bus, polisi),
+// pejalan kaki, dan rendernya. Semua entitas bergerak di koordinat dunia.
+import { V_ROADS, H_ROADS, ROAD_W, WORLD_W, WORLD_H, isOnRoad, nearestRoadPoint, roadSpawn, resolveBuildingCollision, clampWorld } from './world.js';
 
 export const CAR_COLORS = ['#d63031', '#0984e3', '#fdcb6e', '#00b894', '#e17055', '#6c5ce7', '#f5f6fa', '#2d3436', '#e84393', '#00cec9'];
 export const TAXI_COLOR = '#f1c40f';
@@ -11,40 +11,56 @@ export function createPlayer(x, y) {
     hp: 100, maxHp: 100, cash: 250, ammo: 24, weapon: 'pistol',
     inCar: null, // referensi mobil yang dikendarai, atau null
     punchCooldown: 0, shootCooldown: 0, hurtFlash: 0, moving: false,
+    coins: 0, faresDone: 0,
   };
 }
 
+// type: sedan | taxi | truck | bus | sport ; isPolice menandai mobil polisi.
 export function createCar(x, y, angle, opts = {}) {
+  const type = opts.type || 'sedan';
   return {
     x, y, angle, speed: 0,
     color: opts.color || CAR_COLORS[Math.floor(Math.random() * CAR_COLORS.length)],
-    type: opts.type || 'sedan', // sedan | taxi | truck | police | sport
-    isPolice: !!opts.isPolice,
+    type, isPolice: !!opts.isPolice,
     isPlayerCar: false,
     driver: opts.driver !== false, // mobil lalu lintas berpengemudi
     targetSpeed: opts.targetSpeed || 90 + Math.random() * 60,
-    turnAt: null, stuck: 0, sirenPhase: Math.random() * 10,
-    w: opts.type === 'truck' ? 56 : 46,
-    h: opts.type === 'truck' ? 24 : 22,
+    turnAt: null, turnTarget: undefined, stuck: 0, sirenPhase: Math.random() * 10,
+    // Kondisi mobil: rusak bila sering menabrak; berasap bila parah.
+    health: 100, fuel: 100,
+    w: type === 'truck' ? 56 : type === 'bus' ? 68 : 46,
+    h: type === 'truck' ? 24 : type === 'bus' ? 24 : 22,
   };
 }
 
 export function createPedestrian(x, y, random) {
+  const shirts = ['#e74c3c', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#2c3e50'];
   return {
     x, y, angle: random() * Math.PI * 2, speed: 28 + random() * 22,
     color: ['#e74c3c', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#ecf0f1'][Math.floor(random() * 6)],
-    shirt: ['#e74c3c', '#3498db', '#f39c12', '#9b59b6', '#1abc9c', '#2c3e50'][Math.floor(random() * 6)],
-    panic: 0, retarget: 0,
+    shirt: shirts[Math.floor(random() * shirts.length)],
+    panic: 0, retarget: 0, waitingTaxi: false,
   };
 }
 
-// ---- Kendaraan pemain: fisika arcade sederhana ----
+export function angleDiff(target, current) {
+  let d = target - current;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+// ---- Kendaraan pemain: fisika arcade + bahan bakar + kerusakan ----
 export function updatePlayerCar(car, input, dt, buildings) {
-  const accel = input.up ? 320 : input.down ? -220 : 0;
+  // Tangki kosong: mobil mogok (tidak bisa gas).
+  const outOfFuel = car.fuel <= 0;
+  const accel = outOfFuel ? 0 : (input.up ? 320 : input.down ? -220 : 0);
   car.speed += accel * dt;
   if (!input.up && !input.down) car.speed *= Math.pow(0.4, dt); // gesekan
   const maxF = 340, maxR = -140;
   car.speed = Math.max(maxR, Math.min(maxF, car.speed));
+  // Bahan bakar habis sebanding dengan kecepatan.
+  if (Math.abs(car.speed) > 20) car.fuel = Math.max(0, car.fuel - Math.abs(car.speed) * dt * 0.004);
   const steer = (input.left ? -1 : 0) + (input.right ? 1 : 0);
   const dir = car.speed >= 0 ? 1 : -1;
   car.angle += steer * 2.4 * dt * dir * Math.min(1, Math.abs(car.speed) / 120);
@@ -53,11 +69,14 @@ export function updatePlayerCar(car, input, dt, buildings) {
   const oldX = car.x, oldY = car.y;
   car.x = nx; car.y = ny;
   clampWorld(car, 24);
-  // Tabrak bangunan: pantulkan sedikit, kurangi kecepatan.
-  const hit = resolveBuildingCollision(buildings, car, 20);
-  if (hit) car.speed *= 0.45;
+  // Tabrak bangunan: pantulkan sedikit, kurangi kecepatan + kondisi mobil.
+  if (resolveBuildingCollision(buildings, car, 20)) {
+    if (Math.abs(car.speed) > 120) car.health = Math.max(0, car.health - 12);
+    car.speed *= 0.45;
+  }
   if (Math.abs(car.x - oldX) < 0.01 && Math.abs(car.y - oldY) < 0.01 && Math.abs(car.speed) > 60) {
     car.speed *= 0.5;
+    car.health = Math.max(0, car.health - 6);
   }
   return car;
 }
@@ -85,7 +104,7 @@ export function updateTrafficCar(car, dt, buildings, cars, random) {
         car.turnTarget = undefined; car.turnAt = null;
       }
     }
-    // Perlambat bila ada mobil di depan.
+    // Perlambat bila ada mobil di depan; klakson bila macet lama.
     let ahead = false;
     for (const other of cars) {
       if (other === car) continue;
@@ -95,6 +114,7 @@ export function updateTrafficCar(car, dt, buildings, cars, random) {
     }
     const want = ahead ? 0 : car.targetSpeed;
     car.speed += (want - car.speed) * Math.min(1, 1.6 * dt);
+    if (ahead) car.stuck += dt; else car.stuck = 0;
   }
   car.x += Math.cos(car.angle) * car.speed * dt;
   car.y += Math.sin(car.angle) * car.speed * dt;
@@ -108,13 +128,6 @@ export function updateTrafficCar(car, dt, buildings, cars, random) {
       car.y += (p.y - car.y) * Math.min(1, dt);
     }
   }
-}
-
-export function angleDiff(target, current) {
-  let d = target - current;
-  while (d > Math.PI) d -= Math.PI * 2;
-  while (d < -Math.PI) d += Math.PI * 2;
-  return d;
 }
 
 // ---- Polisi: mengejar pemain, menabrak untuk menghentikan ----
@@ -132,7 +145,7 @@ export function updatePoliceCar(car, playerPos, dt, buildings) {
   return dist;
 }
 
-// ---- Pejalan kaki: berjalan di trotoar, panik saat ada tembakan/kejar-kejaran ----
+// ---- Pejalan kaki: berjalan di trotoar, panik saat ada bahaya ----
 export function updatePedestrian(ped, dt, buildings, danger) {
   ped.retarget -= dt;
   if (ped.panic > 0) ped.panic -= dt;
@@ -173,6 +186,16 @@ export function updatePlayerOnFoot(player, input, dt, buildings) {
 }
 
 // ---- Render entitas ----
+export function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
 export function drawCar(ctx, car, time) {
   ctx.save();
   ctx.translate(car.x, car.y);
@@ -180,8 +203,8 @@ export function drawCar(ctx, car, time) {
   // Bayangan.
   ctx.fillStyle = 'rgba(0,0,0,0.3)';
   ctx.fillRect(-car.w / 2 + 3, -car.h / 2 + 4, car.w, car.h);
-  // Badan.
-  ctx.fillStyle = car.color;
+  // Badan (lebih gelap bila rusak).
+  ctx.fillStyle = car.health < 40 ? shade(car.color, -40) : car.color;
   roundRect(ctx, -car.w / 2, -car.h / 2, car.w, car.h, 7);
   ctx.fill();
   // Kabin + kaca.
@@ -202,6 +225,16 @@ export function drawCar(ctx, car, time) {
     ctx.font = 'bold 8px sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText('TAXI', 0, 3);
+    ctx.fillStyle = '#111';
+    ctx.fillRect(-car.w / 2 + 6, -car.h / 2 - 4, 12, 4);
+  }
+  if (car.type === 'bus') {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 8px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('BUS KOTA', 0, 3);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    for (let wx = -car.w / 2 + 14; wx < car.w / 2 - 8; wx += 12) ctx.fillRect(wx, -car.h / 2 + 5, 7, 4);
   }
   if (car.isPolice) {
     ctx.fillStyle = '#fff';
@@ -216,11 +249,32 @@ export function drawCar(ctx, car, time) {
     ctx.beginPath(); ctx.arc(6, -car.h / 2 - 1, 4, 0, Math.PI * 2); ctx.fill();
   }
   ctx.restore();
+  // Asap bila mobil rusak parah (di luar rotasi agar naik ke atas layar).
+  if (car.health < 40) {
+    ctx.fillStyle = `rgba(80,80,80,${0.35 + 0.2 * Math.sin(time / 90)})`;
+    ctx.beginPath();
+    ctx.arc(car.x + Math.sin(time / 120) * 4, car.y - 14, 7, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// Gelapkan warna hex sebanyak amt (untuk mobil rusak).
+export function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  const r = Math.max(0, Math.min(255, (n >> 16) + amt));
+  const g = Math.max(0, Math.min(255, ((n >> 8) & 255) + amt));
+  const b = Math.max(0, Math.min(255, (n & 255) + amt));
+  return `rgb(${r},${g},${b})`;
 }
 
 export function drawPlayer(ctx, player, time) {
   ctx.save();
   ctx.translate(player.x, player.y);
+  // Cincin putih tipis di bawah pemain jalan kaki: mudah dikenali di antara
+  // pejalan kaki dan musuh (revisi setelah tinjau screenshot v2).
+  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(0, 0, 16, 0, Math.PI * 2); ctx.stroke();
   if (player.hurtFlash > 0) ctx.globalAlpha = 0.6 + 0.4 * Math.sin(time / 40);
   ctx.rotate(player.angle);
   // Bayangan.
@@ -242,7 +296,7 @@ export function drawPlayer(ctx, player, time) {
   ctx.restore();
 }
 
-export function drawPedestrian(ctx, ped) {
+export function drawPedestrian(ctx, ped, time) {
   ctx.save();
   ctx.translate(ped.x, ped.y);
   ctx.fillStyle = 'rgba(0,0,0,0.25)';
@@ -252,27 +306,30 @@ export function drawPedestrian(ctx, ped) {
   ctx.fillStyle = ped.color;
   ctx.beginPath(); ctx.arc(0, 0, 4, 0, Math.PI * 2); ctx.fill();
   ctx.restore();
+  // Penumpang taksi menunggu: tanda "!" kuning di atas kepala.
+  if (ped.waitingTaxi) {
+    ctx.fillStyle = '#ffd32a';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('!', ped.x, ped.y - 14 + Math.sin(time / 200) * 2);
+  }
 }
 
-export function roundRect(ctx, x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
-}
-
+// Arah mobil diselaraskan sumbu jalan tempat ia di-spawn (perbaikan v1:
+// dulu sudut 0/π dipakai untuk jalan vertikal juga, mobil melintang).
 export function spawnTraffic(random, count, playerPos) {
   const cars = [];
-  for (let i = 0; i < count; i++) {
+  let guard = 0;
+  while (cars.length < count && guard < count * 40) {
+    guard++;
     const p = roadSpawn(random);
-    if (Math.hypot(p.x - playerPos.x, p.y - playerPos.y) < 320) { i--; continue; }
-    const axis = Math.abs(p.x - Math.round(p.x)) < 1 ? 'v' : 'h';
-    const angle = Math.random() < 0.5 ? 0 : Math.PI;
-    const type = Math.random() < 0.12 ? 'taxi' : Math.random() < 0.1 ? 'truck' : 'sedan';
-    cars.push(createCar(p.x, p.y, type === 'taxi' ? angle : angle, {
+    if (Math.hypot(p.x - playerPos.x, p.y - playerPos.y) < 320) continue;
+    const roll = random();
+    const type = roll < 0.1 ? 'taxi' : roll < 0.2 ? 'truck' : roll < 0.26 ? 'bus' : 'sedan';
+    const angle = p.axis === 'v'
+      ? (random() < 0.5 ? Math.PI / 2 : -Math.PI / 2)
+      : (random() < 0.5 ? 0 : Math.PI);
+    cars.push(createCar(p.x, p.y, angle, {
       color: type === 'taxi' ? TAXI_COLOR : undefined, type,
     }));
   }
@@ -281,9 +338,11 @@ export function spawnTraffic(random, count, playerPos) {
 
 export function spawnPedestrians(random, count, playerPos) {
   const peds = [];
-  for (let i = 0; i < count; i++) {
+  let guard = 0;
+  while (peds.length < count && guard < count * 40) {
+    guard++;
     const p = roadSpawn(random);
-    if (Math.hypot(p.x - playerPos.x, p.y - playerPos.y) < 260) { i--; continue; }
+    if (Math.hypot(p.x - playerPos.x, p.y - playerPos.y) < 260) continue;
     peds.push(createPedestrian(p.x + 70, p.y + 70, random));
   }
   return peds;
