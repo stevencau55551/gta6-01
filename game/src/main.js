@@ -534,6 +534,9 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
+// Hook baca-saja untuk play-test otomatis (tidak memengaruhi permainan).
+window.__telukArun = state;
+
 if (shot) {
   stageShot(shot);
 } else {
